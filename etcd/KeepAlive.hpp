@@ -86,7 +86,7 @@ class KeepAlive {
 
  protected:
   // automatically refresh loop
-  void refresh();
+  // void refresh();
   // refresh once immediately
   void refresh_once();
 
@@ -104,15 +104,15 @@ class KeepAlive {
   // Don't use `pplx::task` to avoid sharing thread pool with other actions on
   // the client to avoid any potential blocking, which may block the keepalive
   // loop and evict the lease.
-  std::thread refresh_task_;
+  // std::thread refresh_task_;
 
   int ttl;
   int64_t lease_id;
 
   // protect the initializing status of `timer`.
-  std::mutex mutex_for_refresh_;
-  std::condition_variable cv_for_refresh_;
-  std::atomic_bool continue_next;
+  // std::mutex mutex_for_refresh_;
+  // std::condition_variable cv_for_refresh_;
+  // std::atomic_bool continue_next;
 
   // grpc timeout in `refresh()`
   mutable std::chrono::microseconds grpc_timeout =
