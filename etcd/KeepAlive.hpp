@@ -110,9 +110,9 @@ class KeepAlive {
   int64_t lease_id;
 
   // protect the initializing status of `timer`.
-  // std::mutex mutex_for_refresh_;
+  std::mutex mutex_for_refresh_;
   // std::condition_variable cv_for_refresh_;
-  // std::atomic_bool continue_next;
+  std::atomic_bool continue_next;
 
   // grpc timeout in `refresh()`
   mutable std::chrono::microseconds grpc_timeout =
