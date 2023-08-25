@@ -44,15 +44,15 @@ etcd::KeepAlive::KeepAlive(SyncClient const& client, int ttl, int64_t lease_id)
   continue_next.store(true);
 
   stubs->call.reset(new etcdv3::AsyncLeaseKeepAliveAction(std::move(params)));
-  refresh_task_ = std::thread([this]() {
-    try {
-      // start refresh
-      this->refresh();
-    } catch (const std::exception& e) {
-      // propagate the exception
-      eptr_ = std::current_exception();
-    }
-  });
+  // refresh_task_ = std::thread([this]() {
+  //   try {
+  //     // start refresh
+  //     this->refresh();
+  //   } catch (const std::exception& e) {
+  //     // propagate the exception
+  //     eptr_ = std::current_exception();
+  //   }
+  // });
 }
 
 etcd::KeepAlive::KeepAlive(std::string const& address, int ttl,
@@ -97,18 +97,18 @@ etcd::KeepAlive::KeepAlive(
   params.lease_stub = stubs->leaseServiceStub.get();
 
   stubs->call.reset(new etcdv3::AsyncLeaseKeepAliveAction(std::move(params)));
-  refresh_task_ = std::thread([this]() {
-    try {
-      // start refresh
-      this->refresh();
-    } catch (...) {
-      // propogate the exception
-      eptr_ = std::current_exception();
-      if (handler_) {
-        handler_(eptr_);
-      }
-    }
-  });
+  // refresh_task_ = std::thread([this]() {
+  //   try {
+  //     // start refresh
+  //     this->refresh();
+  //   } catch (...) {
+  //     // propogate the exception
+  //     eptr_ = std::current_exception();
+  //     if (handler_) {
+  //       handler_(eptr_);
+  //     }
+  //   }
+  // });
 }
 
 etcd::KeepAlive::KeepAlive(
@@ -133,8 +133,8 @@ void etcd::KeepAlive::Cancel() {
   }
 
   // stop the thread
-  cv_for_refresh_.notify_all();
-  refresh_task_.join();
+  // cv_for_refresh_.notify_all();
+  // refresh_task_.join();
 
   // send a cancel request
   {
@@ -166,25 +166,25 @@ void etcd::KeepAlive::Check() {
   }
 }
 
-void etcd::KeepAlive::refresh() {
-  while (true) {
-    if (!continue_next.load()) {
-      return;
-    }
-    // minimal resolution: 1 second
-    int keepalive_ttl = std::max(ttl - 1, 1);
-    {
-      std::unique_lock<std::mutex> lock(mutex_for_refresh_);
-      if (cv_for_refresh_.wait_for(lock, std::chrono::seconds(keepalive_ttl)) ==
-          std::cv_status::no_timeout) {
-        return;
-      }
-    }
+// void etcd::KeepAlive::refresh() {
+//   while (true) {
+//     if (!continue_next.load()) {
+//       return;
+//     }
+//     // minimal resolution: 1 second
+//     int keepalive_ttl = std::max(ttl - 1, 1);
+//     {
+//       std::unique_lock<std::mutex> lock(mutex_for_refresh_);
+//       if (cv_for_refresh_.wait_for(lock, std::chrono::seconds(keepalive_ttl)) ==
+//           std::cv_status::no_timeout) {
+//         return;
+//       }
+//     }
 
-    // execute refresh
-    this->refresh_once();
-  }
-}
+//     // execute refresh
+//     this->refresh_once();
+//   }
+// }
 
 void etcd::KeepAlive::refresh_once() {
   std::lock_guard<std::mutex> scope_lock(mutex_for_refresh_);
