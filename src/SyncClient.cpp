@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 #endif
 
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -37,6 +38,7 @@
 #include <grpc++/grpc++.h>
 #include <grpc++/security/credentials.h>
 #include <grpc++/support/status_code_enum.h>
+#include <grpc/grpc.h>  // for grpc_lame_client_channel_create()
 
 #include "proto/rpc.grpc.pb.h"
 #include "proto/v3election.grpc.pb.h"
@@ -48,6 +50,22 @@
 #include "etcd/v3/AsyncGRPC.hpp"
 #include "etcd/v3/Transaction.hpp"
 #include "etcd/v3/action_constants.hpp"
+
+namespace grpc {
+// forward declaration for compatibility with older grpc versions
+std::shared_ptr<Channel> CreateChannelInternal(
+    const std::string& host, grpc_channel* c_channel,
+#if defined(WITH_GRPC_CREATE_CHANNEL_INTERNAL_UNIQUE_POINTER)
+    std::unique_ptr<std::vector<
+        std::unique_ptr<experimental::ClientInterceptorFactoryInterface>>>
+        interceptor_creators
+#else
+    std::vector<
+        std::unique_ptr<grpc::experimental::ClientInterceptorFactoryInterface>>
+        interceptor_creators
+#endif
+);
+}  // namespace grpc
 
 namespace etcd {
 namespace detail {
@@ -70,7 +88,7 @@ static void string_split(std::vector<std::string>& dests,
 }
 
 static std::string string_join(std::vector<std::string> const& srcs,
-                               std::string const sep) {
+                               std::string const& sep) {
   std::stringstream ss;
   if (!srcs.empty()) {
     ss << srcs[0];
@@ -82,17 +100,30 @@ static std::string string_join(std::vector<std::string> const& srcs,
 }
 
 static bool dns_resolve(std::string const& target,
-                        std::vector<std::string>& endpoints) {
-  struct addrinfo hints = {}, *addrs;
-  hints.ai_family = AF_INET;
-  hints.ai_socktype = SOCK_STREAM;
-  hints.ai_protocol = IPPROTO_TCP;
-
+                        std::vector<std::string>& endpoints, bool ipv4 = true) {
   std::vector<std::string> target_parts;
-  string_split(target_parts, target, ":");
-  if (target_parts.size() != 2) {
-    std::cerr << "warn: invalid URL: " << target << std::endl;
-    return false;
+  bool ipv6_url{false};
+  {
+    size_t rindex = target.rfind(':');
+    if (rindex == target.npos) {
+#ifndef NDEBUG
+      std::cerr << "[warn] invalid URL: " << target << ", expects 'host:port'"
+                << std::endl;
+#endif
+      return false;
+    }
+
+    std::string host(target.substr(0, rindex));
+
+    // host format is [ipv6]
+    if (!ipv4 && !host.empty() && host[0] == '[' &&
+        host[host.size() - 1] == ']') {
+      host = target.substr(1, rindex - 2);
+      ipv6_url = true;
+    }
+
+    target_parts.push_back(host);
+    target_parts.push_back(target.substr(rindex + 1));
   }
 
 #if defined(_WIN32)
@@ -104,26 +135,61 @@ static bool dns_resolve(std::string const& target,
     int err = WSAStartup(wVersionRequested, &wsaData);
     if (err != 0) {
       // Tell the user that we could not find a usable Winsock DLL.
-      std::cerr << "WSAStartup failed with error: %d" << err << std::endl;
+#ifndef NDEBUG
+      std::cerr << "[warn] WSAStartup failed with error: %d" << err
+                << std::endl;
+#endif
       return false;
     }
   }
 #endif
 
+  if (ipv6_url) {
+    // check valid ipv6
+    struct sockaddr_in6 sa6;
+    if (inet_pton(AF_INET6, target_parts[0].c_str(), &(sa6.sin6_addr)) == 1) {
+      endpoints.emplace_back(target);
+      return true;
+    }
+    return false;
+  }
+
+  struct addrinfo hints = {}, *addrs;
+  hints.ai_family = ipv4 ? AF_INET : AF_INET6;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_protocol = IPPROTO_TCP;
+
   int r = getaddrinfo(target_parts[0].c_str(), target_parts[1].c_str(), &hints,
                       &addrs);
   if (r != 0) {
-    std::cerr << "warn: getaddrinfo() failed for endpoint " << target
-              << " with error: " << r << std::endl;
+#ifndef NDEBUG
+    std::cerr << "[warn] getaddrinfo() as " << (ipv4 ? "ipv4" : "ipv6")
+              << " failed for endpoint " << target << " with error: " << r
+              << ", " << strerror(errno) << std::endl;
+#endif
     return false;
   }
 
   char host[16] = {'\0'};
   for (struct addrinfo* addr = addrs; addr != nullptr; addr = addr->ai_next) {
+    if (addr->ai_family != AF_INET && addr->ai_family != AF_INET6) {
+      continue;
+    }
     memset(host, '\0', sizeof(host));
-    getnameinfo(addr->ai_addr, addr->ai_addrlen, host, sizeof(host), NULL, 0,
-                NI_NUMERICHOST);
-    endpoints.emplace_back(std::string(host) + ":" + target_parts[1]);
+    int r = getnameinfo(addr->ai_addr, addr->ai_addrlen, host, sizeof(host),
+                        NULL, 0, NI_NUMERICHOST);
+    if (r != 0) {
+#ifndef NDEBUG
+      std::cerr << "[warn] getnameinfo() failed for endpoint " << target
+                << " with error: " << r << ", " << strerror(errno) << std::endl;
+#endif
+      continue;
+    }
+    std::string host_string = host;
+    if (addr->ai_family == AF_INET6) {
+      host_string = "[" + host_string + "]";
+    }
+    endpoints.emplace_back(host_string + ":" + target_parts[1]);
   }
   freeaddrinfo(addrs);
   return true;
@@ -132,25 +198,33 @@ static bool dns_resolve(std::string const& target,
 const std::string strip_and_resolve_addresses(std::string const& address) {
   std::vector<std::string> addresses;
   string_split(addresses, address, ",;");
-  std::string stripped_address;
+  std::string stripped_v4_address, stripped_v6_address;
   {
-    std::vector<std::string> stripped_addresses;
+    std::vector<std::string> stripped_v4_addresses, stripped_v6_addresses;
     std::string substr("://");
     for (auto const& addr : addresses) {
       std::string::size_type idx = addr.find(substr);
       std::string target =
           idx == std::string::npos ? addr : addr.substr(idx + substr.length());
-      etcd::detail::dns_resolve(target, stripped_addresses);
+      etcd::detail::dns_resolve(target, stripped_v4_addresses, true);
+      etcd::detail::dns_resolve(target, stripped_v6_addresses, false);
     }
-    stripped_address = string_join(stripped_addresses, ",");
+    stripped_v4_address = string_join(stripped_v4_addresses, ",");
+    stripped_v6_address = string_join(stripped_v6_addresses, ",");
   }
-  return "ipv4:///" + stripped_address;
+  // prefer resolved ipv4 addresses
+  if (!stripped_v4_address.empty()) {
+    return "ipv4:///" + stripped_v4_address;
+  }
+  if (!stripped_v6_address.empty()) {
+    return "ipv6:///" + stripped_v6_address;
+  }
+  return std::string{};
 }
 
-const bool authenticate(std::shared_ptr<grpc::Channel> const& channel,
-                        std::string const& username,
-                        std::string const& password,
-                        std::string& token_or_message) {
+bool authenticate(std::shared_ptr<grpc::Channel> const& channel,
+                  std::string const& username, std::string const& password,
+                  std::string& token_or_message) {
   // run a round of auth
   auto auth_stub = etcdserverpb::Auth::NewStub(channel);
   ClientContext context;
@@ -176,10 +250,12 @@ static std::string read_from_file(std::string const& filename) {
     file.close();
     return ss.str();
   } else {
-    std::cerr << "[ERROR] failed to load given file '" << filename << "', "
+#ifndef NDEBUG
+    std::cerr << "[error] failed to load given file '" << filename << "', "
               << strerror(errno) << std::endl;
+#endif
+    return std::string{};
   }
-  return std::string{};
 }
 
 static grpc::SslCredentialsOptions make_ssl_credentials(
@@ -194,6 +270,33 @@ static grpc::SslCredentialsOptions make_ssl_credentials(
 template <typename T, typename... Args>
 std::unique_ptr<T> make_unique_ptr(Args&&... args) {
   return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
+}
+
+static std::shared_ptr<grpc::Channel> create_grpc_channel(
+    const std::string& address,
+    const std::shared_ptr<grpc::ChannelCredentials> creds,
+    const grpc::ChannelArguments& grpc_args) {
+  const std::string addresses =
+      etcd::detail::strip_and_resolve_addresses(address);
+#ifndef NDEBUG
+  std::cerr << "[debug] resolved addresses: " << addresses << std::endl;
+#endif
+  if (addresses.empty() || addresses == "ipv4:///" || addresses == "ipv6:///") {
+    // bypass grpc initialization to avoid noisy logs from grpc
+    return grpc::CreateChannelInternal(
+        "",
+        grpc_lame_client_channel_create(addresses.c_str(), GRPC_STATUS_INTERNAL,
+                                        "the target uri is not valid"),
+#if defined(WITH_GRPC_CREATE_CHANNEL_INTERNAL_UNIQUE_POINTER)
+        nullptr
+#else
+        std::vector<std::unique_ptr<
+            grpc::experimental::ClientInterceptorFactoryInterface>>()
+#endif
+    );
+  } else {
+    return grpc::CreateCustomChannel(addresses, creds, grpc_args);
+  }
 }
 
 }  // namespace detail
@@ -239,7 +342,11 @@ class etcd::SyncClient::TokenAuthenticator {
         // auth
         if (!etcd::detail::authenticate(this->channel_, username_, password_,
                                         token_)) {
-          throw std::invalid_argument("Etcd authentication failed: " + token_);
+          // n.b.: no throw here as the failure of auth will be propagated
+          // to client when it is asked to issue requests.
+          //
+          // throw std::invalid_argument("Etcd authentication failed: " +
+          // token_);
         }
       }
     }
@@ -257,6 +364,7 @@ void etcd::SyncClient::TokenAuthenticatorDeleter::operator()(
 struct etcd::SyncClient::EtcdServerStubs {
   std::unique_ptr<etcdserverpb::KV::Stub> kvServiceStub;
   std::unique_ptr<etcdserverpb::Watch::Stub> watchServiceStub;
+  std::unique_ptr<etcdserverpb::Cluster::Stub> clusterServiceStub;
   std::unique_ptr<etcdserverpb::Lease::Stub> leaseServiceStub;
   std::unique_ptr<v3lockpb::Lock::Stub> lockServiceStub;
   std::unique_ptr<v3electionpb::Election::Stub> electionServiceStub;
@@ -272,21 +380,20 @@ void etcd::SyncClient::EtcdServerStubsDeleter::operator()(
 etcd::SyncClient::SyncClient(std::string const& address,
                              std::string const& load_balancer) {
   // create channels
-  std::string const addresses =
-      etcd::detail::strip_and_resolve_addresses(address);
   grpc::ChannelArguments grpc_args;
   grpc_args.SetMaxSendMessageSize(std::numeric_limits<int>::max());
   grpc_args.SetMaxReceiveMessageSize(std::numeric_limits<int>::max());
   std::shared_ptr<grpc::ChannelCredentials> creds =
       grpc::InsecureChannelCredentials();
   grpc_args.SetLoadBalancingPolicyName(load_balancer);
-  this->channel = grpc::CreateCustomChannel(addresses, creds, grpc_args);
+  this->channel = etcd::detail::create_grpc_channel(address, creds, grpc_args);
   this->token_authenticator.reset(new TokenAuthenticator());
 
   // create stubs
   stubs.reset(new EtcdServerStubs{});
   stubs->kvServiceStub = KV::NewStub(this->channel);
   stubs->watchServiceStub = Watch::NewStub(this->channel);
+  stubs->clusterServiceStub = Cluster::NewStub(this->channel);
   stubs->leaseServiceStub = Lease::NewStub(this->channel);
   stubs->lockServiceStub = Lock::NewStub(this->channel);
   stubs->electionServiceStub = Election::NewStub(this->channel);
@@ -295,14 +402,12 @@ etcd::SyncClient::SyncClient(std::string const& address,
 etcd::SyncClient::SyncClient(std::string const& address,
                              grpc::ChannelArguments const& arguments) {
   // create channels
-  std::string const addresses =
-      etcd::detail::strip_and_resolve_addresses(address);
   grpc::ChannelArguments grpc_args = arguments;
   grpc_args.SetMaxSendMessageSize(std::numeric_limits<int>::max());
   grpc_args.SetMaxReceiveMessageSize(std::numeric_limits<int>::max());
   std::shared_ptr<grpc::ChannelCredentials> creds =
       grpc::InsecureChannelCredentials();
-  this->channel = grpc::CreateCustomChannel(addresses, creds, grpc_args);
+  this->channel = etcd::detail::create_grpc_channel(address, creds, grpc_args);
   this->token_authenticator.reset(new TokenAuthenticator());
 
   // create stubs
@@ -330,15 +435,13 @@ etcd::SyncClient::SyncClient(std::string const& address,
                              int const auth_token_ttl,
                              std::string const& load_balancer) {
   // create channels
-  std::string const addresses =
-      etcd::detail::strip_and_resolve_addresses(address);
   grpc::ChannelArguments grpc_args;
   grpc_args.SetMaxSendMessageSize(std::numeric_limits<int>::max());
   grpc_args.SetMaxReceiveMessageSize(std::numeric_limits<int>::max());
   std::shared_ptr<grpc::ChannelCredentials> creds =
       grpc::InsecureChannelCredentials();
   grpc_args.SetLoadBalancingPolicyName(load_balancer);
-  this->channel = grpc::CreateCustomChannel(addresses, creds, grpc_args);
+  this->channel = etcd::detail::create_grpc_channel(address, creds, grpc_args);
 
   // auth
   this->token_authenticator.reset(new TokenAuthenticator(
@@ -359,14 +462,12 @@ etcd::SyncClient::SyncClient(std::string const& address,
                              int const auth_token_ttl,
                              grpc::ChannelArguments const& arguments) {
   // create channels
-  std::string const addresses =
-      etcd::detail::strip_and_resolve_addresses(address);
   grpc::ChannelArguments grpc_args = arguments;
   grpc_args.SetMaxSendMessageSize(std::numeric_limits<int>::max());
   grpc_args.SetMaxReceiveMessageSize(std::numeric_limits<int>::max());
   std::shared_ptr<grpc::ChannelCredentials> creds =
       grpc::InsecureChannelCredentials();
-  this->channel = grpc::CreateCustomChannel(addresses, creds, grpc_args);
+  this->channel = etcd::detail::create_grpc_channel(address, creds, grpc_args);
 
   // auth
   this->token_authenticator.reset(new TokenAuthenticator(
@@ -404,8 +505,6 @@ etcd::SyncClient::SyncClient(std::string const& address, std::string const& ca,
                              std::string const& target_name_override,
                              std::string const& load_balancer) {
   // create channels
-  std::string const addresses =
-      etcd::detail::strip_and_resolve_addresses(address);
   grpc::ChannelArguments grpc_args;
   grpc_args.SetMaxSendMessageSize(std::numeric_limits<int>::max());
   grpc_args.SetMaxReceiveMessageSize(std::numeric_limits<int>::max());
@@ -416,7 +515,7 @@ etcd::SyncClient::SyncClient(std::string const& address, std::string const& ca,
     grpc_args.SetString(GRPC_SSL_TARGET_NAME_OVERRIDE_ARG,
                         target_name_override);
   }
-  this->channel = grpc::CreateCustomChannel(addresses, creds, grpc_args);
+  this->channel = etcd::detail::create_grpc_channel(address, creds, grpc_args);
   this->token_authenticator.reset(new TokenAuthenticator());
 
   // setup stubs
@@ -434,8 +533,6 @@ etcd::SyncClient::SyncClient(std::string const& address, std::string const& ca,
                              std::string const& target_name_override,
                              grpc::ChannelArguments const& arguments) {
   // create channels
-  std::string const addresses =
-      etcd::detail::strip_and_resolve_addresses(address);
   grpc::ChannelArguments grpc_args = arguments;
   grpc_args.SetMaxSendMessageSize(std::numeric_limits<int>::max());
   grpc_args.SetMaxReceiveMessageSize(std::numeric_limits<int>::max());
@@ -445,7 +542,7 @@ etcd::SyncClient::SyncClient(std::string const& address, std::string const& ca,
     grpc_args.SetString(GRPC_SSL_TARGET_NAME_OVERRIDE_ARG,
                         target_name_override);
   }
-  this->channel = grpc::CreateCustomChannel(addresses, creds, grpc_args);
+  this->channel = etcd::detail::create_grpc_channel(address, creds, grpc_args);
   this->token_authenticator.reset(new TokenAuthenticator());
 
   // setup stubs
@@ -922,6 +1019,60 @@ etcd::SyncClient::leases_internal() {
   return std::make_shared<etcdv3::AsyncLeaseLeasesAction>(std::move(params));
 }
 
+etcd::Response etcd::SyncClient::add_member(std::string const& peer_urls,
+                                            bool is_learner) {
+  return Response::create(this->add_member_internal(peer_urls, is_learner));
+}
+
+std::shared_ptr<etcdv3::AsyncAddMemberAction>
+etcd::SyncClient::add_member_internal(std::string const& peer_urls,
+                                      bool is_learner) {
+  etcdv3::ActionParameters params;
+  params.auth_token.assign(this->token_authenticator->renew_if_expired());
+  params.grpc_timeout = this->grpc_timeout;
+  params.cluster_stub = stubs->clusterServiceStub.get();
+
+  std::vector<std::string> peer_urls_vector;
+  std::istringstream iss(peer_urls);
+  std::string peer_url;
+  while (std::getline(iss, peer_url, ',')) {
+    peer_urls_vector.push_back(peer_url);
+  }
+
+  params.is_learner = is_learner;
+  params.peer_urls = peer_urls_vector;
+
+  return std::make_shared<etcdv3::AsyncAddMemberAction>(std::move(params));
+}
+
+etcd::Response etcd::SyncClient::list_member() {
+  return Response::create(this->list_member_internal());
+}
+
+std::shared_ptr<etcdv3::AsyncListMemberAction>
+etcd::SyncClient::list_member_internal() {
+  etcdv3::ActionParameters params;
+  params.auth_token.assign(this->token_authenticator->renew_if_expired());
+  params.grpc_timeout = this->grpc_timeout;
+  params.cluster_stub = stubs->clusterServiceStub.get();
+  return std::make_shared<etcdv3::AsyncListMemberAction>(std::move(params));
+}
+
+etcd::Response etcd::SyncClient::remove_member(const uint64_t member_id) {
+  return Response::create(this->remove_member_internal(member_id));
+}
+
+std::shared_ptr<etcdv3::AsyncRemoveMemberAction>
+etcd::SyncClient::remove_member_internal(const uint64_t member_id) {
+  etcdv3::ActionParameters params;
+  params.auth_token.assign(this->token_authenticator->renew_if_expired());
+  params.grpc_timeout = this->grpc_timeout;
+  params.cluster_stub = stubs->clusterServiceStub.get();
+  params.member_id = member_id;
+
+  return std::make_shared<etcdv3::AsyncRemoveMemberAction>(std::move(params));
+}
+
 etcd::Response etcd::SyncClient::lock(std::string const& key) {
   // routines in lock usually will be fast, less than 10 seconds.
   //
@@ -1006,15 +1157,15 @@ std::shared_ptr<etcdv3::AsyncUnlockAction> etcd::SyncClient::unlock_internal(
       if (p_keeps_alive != this->keep_alive_for_locks.end()) {
         this->keep_alive_for_locks.erase(p_keeps_alive);
       } else {
-#if !defined(NDEBUG)
-        std::cerr << "Keepalive for lease not found" << std::endl;
+#ifndef NDEBUG
+        std::cerr << "[warn] keepalive for lease not found" << std::endl;
 #endif
       }
       lock_lease_id = p_leases->second;
       this->leases_for_locks.erase(p_leases);
     } else {
-#if !defined(NDEBUG)
-      std::cerr << "Lease for lock not found" << std::endl;
+#ifndef NDEBUG
+      std::cerr << "[warn] lease for lock not found" << std::endl;
 #endif
     }
     if (lock_lease_id != 0) {

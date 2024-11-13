@@ -95,6 +95,43 @@ void etcdv3::AsyncLeaseKeepAliveResponse::ParseResponse(
   value.set_ttl(resp.ttl());
 }
 
+void etcdv3::AsyncMemberAddResponse::ParseResponse(MemberAddResponse& resp) {
+  index = resp.header().revision();
+  std::string member_type = "Member";
+  if (resp.member().islearner()) {
+    member_type = "Learner";
+  }
+  std::cout << "Member (" << resp.member().id() << ")"
+            << " Added to the etcd cluster as " << member_type << std::endl;
+}
+
+void etcdv3::AsyncMemberListResponse::ParseResponse(MemberListResponse& resp) {
+  index = resp.header().revision();
+  for (auto member : resp.members()) {
+    etcdv3::Member m;
+    m.set_id(member.id());
+    m.set_name(member.name());
+
+    std::vector<std::string> clientUrlsVec, peerUrlsVec;
+    for (const auto& clientUrl : member.clienturls()) {
+      clientUrlsVec.push_back(clientUrl);
+    }
+    for (const auto& peerUrl : member.peerurls()) {
+      peerUrlsVec.push_back(peerUrl);
+    }
+
+    m.set_clientURLs(clientUrlsVec);
+    m.set_peerURLs(peerUrlsVec);
+
+    members.push_back(m);
+  }
+}
+
+void etcdv3::AsyncMemberRemoveResponse::ParseResponse(
+    MemberRemoveResponse& resp) {
+  index = resp.header().revision();
+}
+
 void etcdv3::AsyncLeaseLeasesResponse::ParseResponse(
     LeaseLeasesResponse& resp) {
   index = resp.header().revision();
@@ -248,9 +285,12 @@ void etcdv3::AsyncTxnResponse::ParseResponse(TxnResponse& reply) {
       }
 
       // skip
-      std::cerr << "Not implemented error: unable to parse nested transaction "
+#ifndef NDEBUG
+      std::cerr << "[debug] not implemented error: unable to parse nested "
+                   "transaction "
                    "response"
                 << std::endl;
+#endif
     }
   }
   if (!values.empty()) {
@@ -509,7 +549,10 @@ etcdv3::AsyncLeaseKeepAliveAction::AsyncLeaseKeepAliveAction(
       got_tag == (void*) etcdv3::KEEPALIVE_CREATE) {
     // ok
   } else {
-    throw std::runtime_error("Failed to create a lease keep-alive connection");
+    status = grpc::Status(grpc::StatusCode::CANCELLED,
+                          "Failed to create a lease keep-alive connection");
+    // cannot continue for further refresh
+    isCancelled.store(true);
   }
 }
 
@@ -531,7 +574,7 @@ etcd::Response etcdv3::AsyncLeaseKeepAliveAction::Refresh() {
   std::lock_guard<std::recursive_mutex> scope_lock(this->protect_is_cancelled);
 
   auto start_timepoint = std::chrono::high_resolution_clock::now();
-  if (isCancelled) {
+  if (isCancelled.load()) {
     status = grpc::Status::CANCELLED;
     return etcd::Response(ParseResponse(),
                           etcd::detail::duration_till_now(start_timepoint));
@@ -618,9 +661,7 @@ etcd::Response etcdv3::AsyncLeaseKeepAliveAction::Refresh() {
 
 void etcdv3::AsyncLeaseKeepAliveAction::CancelKeepAlive() {
   std::lock_guard<std::recursive_mutex> scope_lock(this->protect_is_cancelled);
-  if (isCancelled == false) {
-    isCancelled = true;
-
+  if (!isCancelled.exchange(true)) {
     void* got_tag = nullptr;
     bool ok = false;
 
@@ -629,17 +670,22 @@ void etcdv3::AsyncLeaseKeepAliveAction::CancelKeepAlive() {
         got_tag == (void*) etcdv3::KEEPALIVE_DONE) {
       // ok
     } else {
-      std::cerr << "Failed to mark a lease keep-alive connection as DONE: "
-                << context.debug_error_string() << std::endl;
+#ifndef NDEBUG
+      std::cerr
+          << "[debug] failed to mark a lease keep-alive connection as DONE: "
+          << context.debug_error_string() << std::endl;
+#endif
     }
 
     stream->Finish(&status, (void*) KEEPALIVE_FINISH);
     if (cq_.Next(&got_tag, &ok) && ok && got_tag == (void*) KEEPALIVE_FINISH) {
       // ok
     } else {
-      std::cerr << "Failed to finish a lease keep-alive connection: "
+#ifndef NDEBUG
+      std::cerr << "[debug] failed to finish a lease keep-alive connection: "
                 << status.error_message() << ", "
                 << context.debug_error_string() << std::endl;
+#endif
     }
 
     // cancel on-the-fly calls
@@ -650,12 +696,87 @@ void etcdv3::AsyncLeaseKeepAliveAction::CancelKeepAlive() {
 }
 
 bool etcdv3::AsyncLeaseKeepAliveAction::Cancelled() const {
-  return isCancelled;
+  return isCancelled.load();
 }
 
 etcdv3::ActionParameters&
 etcdv3::AsyncLeaseKeepAliveAction::mutable_parameters() {
   return this->parameters;
+}
+
+etcdv3::AsyncAddMemberAction::AsyncAddMemberAction(
+    etcdv3::ActionParameters&& params)
+    : etcdv3::Action(std::move(params)) {
+  MemberAddRequest add_member_request;
+
+  for (const auto& url : parameters.peer_urls) {
+    add_member_request.add_peerurls(url);
+  }
+  add_member_request.set_islearner(parameters.is_learner);
+  response_reader = parameters.cluster_stub->AsyncMemberAdd(
+      &context, add_member_request, &cq_);
+  response_reader->Finish(&reply, &status, (void*) this);
+}
+
+etcdv3::AsyncMemberAddResponse etcdv3::AsyncAddMemberAction::ParseResponse() {
+  AsyncMemberAddResponse add_member_resp;
+  add_member_resp.set_action(etcdv3::ADDMEMBER);
+
+  if (!status.ok()) {
+    add_member_resp.set_error_code(status.error_code());
+    add_member_resp.set_error_message(status.error_message());
+  } else {
+    add_member_resp.ParseResponse(reply);
+  }
+  return add_member_resp;
+}
+
+etcdv3::AsyncListMemberAction::AsyncListMemberAction(
+    etcdv3::ActionParameters&& params)
+    : etcdv3::Action(std::move(params)) {
+  MemberListRequest member_list_request;
+
+  response_reader = parameters.cluster_stub->AsyncMemberList(
+      &context, member_list_request, &cq_);
+  response_reader->Finish(&reply, &status, (void*) this);
+}
+
+etcdv3::AsyncMemberListResponse etcdv3::AsyncListMemberAction::ParseResponse() {
+  AsyncMemberListResponse list_member_resp;
+  list_member_resp.set_action(etcdv3::LISTMEMBER);
+
+  if (!status.ok()) {
+    list_member_resp.set_error_code(status.error_code());
+    list_member_resp.set_error_message(status.error_message());
+  } else {
+    list_member_resp.ParseResponse(reply);
+  }
+  return list_member_resp;
+}
+
+etcdv3::AsyncRemoveMemberAction::AsyncRemoveMemberAction(
+    etcdv3::ActionParameters&& params)
+    : etcdv3::Action(std::move(params)) {
+  MemberRemoveRequest remove_member_request;
+
+  remove_member_request.set_id(parameters.member_id);
+  response_reader = parameters.cluster_stub->AsyncMemberRemove(
+      &context, remove_member_request, &cq_);
+  response_reader->Finish(&reply, &status, (void*) this);
+}
+
+etcdv3::AsyncMemberRemoveResponse
+etcdv3::AsyncRemoveMemberAction::ParseResponse() {
+  AsyncMemberRemoveResponse remove_member_resp;
+  remove_member_resp.set_action(etcdv3::REMOVEMEMBER);
+
+  if (!status.ok()) {
+    remove_member_resp.set_error_code(status.error_code());
+    remove_member_resp.set_error_message(status.error_message());
+  } else {
+    remove_member_resp.ParseResponse(reply);
+  }
+  return remove_member_resp;
 }
 
 etcdv3::AsyncLeaseLeasesAction::AsyncLeaseLeasesAction(
@@ -774,7 +895,10 @@ etcdv3::AsyncObserveAction::AsyncObserveAction(
       got_tag == (void*) etcdv3::ELECTION_OBSERVE_CREATE) {
     // n.b.: leave the issue of `Read` to the `waitForResponse`
   } else {
-    throw std::runtime_error("failed to create a observe connection");
+    status = grpc::Status(grpc::StatusCode::CANCELLED,
+                          "failed to create a observe connection");
+    // cannot continue for further observing
+    isCancelled.store(true);
   }
 }
 
@@ -802,7 +926,7 @@ void etcdv3::AsyncObserveAction::waitForResponse() {
 }
 
 void etcdv3::AsyncObserveAction::CancelObserve() {
-  std::lock_guard<std::mutex> scope_lock(this->protect_is_cancalled);
+  std::lock_guard<std::mutex> scope_lock(this->protect_is_cancelled);
   if (!isCancelled.exchange(true)) {
     void* got_tag;
     bool ok = false;
@@ -820,8 +944,10 @@ void etcdv3::AsyncObserveAction::CancelObserve() {
       break;
     case CompletionQueue::NextStatus::GOT_EVENT:
       if (!ok || got_tag != (void*) ELECTION_OBSERVE_FINISH) {
-        std::cerr << "Failed to finish a election observing connection"
+#ifndef NDEBUG
+        std::cerr << "[debug] failed to finish a election observing connection"
                   << std::endl;
+#endif
       }
     }
 
@@ -980,9 +1106,9 @@ etcdv3::AsyncSetAction::AsyncSetAction(etcdv3::ActionParameters&& params,
   // backwards compatibility
   txn.add_success_range(parameters.key);
   if (create) {
-    txn.add_failure_put(parameters.key, parameters.value, parameters.lease_id);
-  } else {
     txn.add_failure_range(parameters.key);
+  } else {
+    txn.add_failure_put(parameters.key, parameters.value, parameters.lease_id);
   }
   response_reader =
       parameters.kv_stub->AsyncTxn(&context, *txn.txn_request, &cq_);
@@ -1120,7 +1246,14 @@ etcdv3::AsyncWatchAction::AsyncWatchAction(etcdv3::ActionParameters&& params)
       got_tag == (void*) etcdv3::WATCH_CREATE) {
     stream->Write(watch_req, (void*) etcdv3::WATCH_WRITE);
   } else {
-    throw std::runtime_error("failed to create a watch connection");
+    status = grpc::Status(grpc::StatusCode::CANCELLED,
+                          "failed to create a watch connection");
+    // cannot continue for further watching
+    isCancelled.store(true);
+  }
+
+  if (!status.ok()) {
+    return;
   }
 
   // wait "write" (WatchCreateRequest) success, and start to read the first
@@ -1128,7 +1261,10 @@ etcdv3::AsyncWatchAction::AsyncWatchAction(etcdv3::ActionParameters&& params)
   if (cq_.Next(&got_tag, &ok) && ok && got_tag == (void*) etcdv3::WATCH_WRITE) {
     stream->Read(&reply, (void*) this);
   } else {
-    throw std::runtime_error("failed to write WatchCreateRequest to server");
+    status = grpc::Status(grpc::StatusCode::CANCELLED,
+                          "failed to write WatchCreateRequest to server");
+    // cannot continue for further watching
+    isCancelled.store(true);
   }
 }
 
@@ -1154,6 +1290,11 @@ void etcdv3::AsyncWatchAction::waitForResponse() {
   bool ok = false;
   bool the_final_round = false;
 
+  // failed to create the watcher
+  if (!status.ok()) {
+    return;
+  }
+
   while (true) {
     if (!the_final_round) {
       if (!cq_.Next(&got_tag, &ok)) {
@@ -1165,7 +1306,9 @@ void etcdv3::AsyncWatchAction::waitForResponse() {
       switch (cq_.AsyncNext(&got_tag, &ok, deadline)) {
       case CompletionQueue::NextStatus::TIMEOUT:
       case CompletionQueue::NextStatus::SHUTDOWN: {
+#ifndef NDEBUG
         std::cerr << "[warn] watcher does't exit normally" << std::endl;
+#endif
         // pretend to be received a "WATCH_FINISH" tag: shutdown
         context.TryCancel();
         cq_.Shutdown();
@@ -1219,7 +1362,6 @@ void etcdv3::AsyncWatchAction::waitForResponse() {
               << std::endl;
         }
 
-        std::cout << "issue a watch cancel" << std::endl;
         // cancel the watcher after receiving the good response
         this->CancelWatch();
 
@@ -1244,6 +1386,14 @@ void etcdv3::AsyncWatchAction::waitForResponse(
   void* got_tag;
   bool ok = false;
   bool the_final_round = false;
+
+  // failed to create the watcher
+  if (!status.ok()) {
+    auto resp = ParseResponse();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now() - start_timepoint);
+    callback(etcd::Response(resp, duration));
+  }
 
   while (true) {
     if (!the_final_round) {

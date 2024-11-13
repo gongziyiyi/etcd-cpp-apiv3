@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "etcd/Value.hpp"
+#include "etcd/v3/Member.hpp"
 
 namespace etcdv3 {
 class AsyncWatchAction;
@@ -34,7 +35,7 @@ class KeepAlive;
 class Watcher;
 
 /**
- * The Reponse object received for the requests of etcd::Client
+ * The Response object received for the requests of etcd::Client
  */
 class Response {
  public:
@@ -208,6 +209,11 @@ class Response {
    */
   std::vector<int64_t> const& leases() const;
 
+  /**
+   * Returns the member list.
+   */
+  std::vector<etcdv3::Member> const& members() const;
+
  protected:
   Response(const etcdv3::V3Response& response,
            std::chrono::microseconds const& duration);
@@ -238,6 +244,9 @@ class Response {
 
   // for lease list
   std::vector<int64_t> _leases;
+
+  // for member list
+  std::vector<etcdv3::Member> _members;
 
   friend class Client;
   friend class SyncClient;

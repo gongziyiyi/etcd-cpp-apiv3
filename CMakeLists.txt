@@ -5,7 +5,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(etcd-cpp-api_VERSION_MAJOR 0)
 set(etcd-cpp-api_VERSION_MINOR 15)
-set(etcd-cpp-api_VERSION_PATCH 3)
+set(etcd-cpp-api_VERSION_PATCH 4)
 set(etcd-cpp-api_VERSION ${etcd-cpp-api_VERSION_MAJOR}.${etcd-cpp-api_VERSION_MINOR}.${etcd-cpp-api_VERSION_PATCH})
 set(CMAKE_PROJECT_HOMEPAGE_URL https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3)
 
@@ -26,6 +26,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     )
 endif()
 
+option(BUILD_WITH_NO_EXCEPTIONS "Build etcd-cpp-apiv3 with disabling exception handling, i.e., -fno-exceptions" OFF)
 option(BUILD_SHARED_LIBS "Build etcd-cpp-apiv3 shared libraries" ON)
 option(BUILD_ETCD_CORE_ONLY "Build etcd-cpp-apiv3 core library (the synchronous runtime) only" OFF)
 option(BUILD_ETCD_TESTS "Build etcd-cpp-apiv3 test cases" OFF)
@@ -88,6 +89,21 @@ macro(use_cxx target)
     endif()
 endmacro(use_cxx)
 
+macro(set_exceptions target)
+    if(BUILD_WITH_NO_EXCEPTIONS)
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+            target_compile_options(${target} PRIVATE "-fno-exceptions")
+        elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+            target_compile_options(${target} PRIVATE "-fno-exceptions")
+        elseif(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+            target_compile_options(${target} PRIVATE "-fno-exceptions")
+        elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+            target_compile_options(${target} PRIVATE "/EHs-c-")
+        endif()
+        target_compile_definitions(${target} PUBLIC -D_ETCD_NO_EXCEPTIONS)
+    endif()
+endmacro(set_exceptions)
+
 if(APPLE)
     # If we're on OS X check for Homebrew's copy of OpenSSL instead of Apple's
     if(NOT OpenSSL_DIR)
@@ -120,10 +136,34 @@ if(Protobuf_PROTOC_EXECUTABLE)
     endif()
 endif()
 
+# When cross compiling we look for the native protoc compiler
+# overwrite protobuf::protoc with the proper protoc
+if(CMAKE_CROSSCOMPILING)
+    find_program(Protobuf_PROTOC_EXECUTABLE REQUIRED NAMES protoc)
+    if(NOT TARGET protobuf::protoc)
+        add_executable(protobuf::protoc IMPORTED)
+    endif()
+    set_target_properties(protobuf::protoc PROPERTIES
+        IMPORTED_LOCATION "${Protobuf_PROTOC_EXECUTABLE}")
+endif()
+
 find_package(gRPC QUIET)
-if(gRPC_FOUND AND TARGET gRPC::grpc AND TARGET gRPC::grpc_cpp_plugin)
+if(gRPC_FOUND AND TARGET gRPC::grpc)
+    # When cross compiling we look for the native grpc_cpp_plugin
+    if(CMAKE_CROSSCOMPILING)
+        find_program(GRPC_CPP_PLUGIN REQUIRED NAMES grpc_cpp_plugin)
+        if(NOT TARGET gRPC::grpc_cpp_plugin)
+            add_executable(gRPC::grpc_cpp_plugin IMPORTED)
+        endif()
+        set_target_properties(gRPC::grpc_cpp_plugin PROPERTIES
+                IMPORTED_LOCATION "${GRPC_CPP_PLUGIN}")
+    elseif(TARGET gRPC::grpc_cpp_plugin)
+        get_target_property(GRPC_CPP_PLUGIN gRPC::grpc_cpp_plugin LOCATION)
+    else()
+        message(FATAL_ERROR "Found gRPC but no gRPC CPP plugin defined")
+    endif()
+
     set(GRPC_LIBRARIES gRPC::gpr gRPC::grpc gRPC::grpc++)
-    get_target_property(GRPC_CPP_PLUGIN gRPC::grpc_cpp_plugin LOCATION)
     get_target_property(GRPC_INCLUDE_DIR gRPC::grpc INTERFACE_INCLUDE_DIRECTORIES)
 else()
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindGRPC.cmake)
@@ -141,6 +181,9 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenerateProtobufGRPC.cmake)
 
 if(gRPC_VERSION VERSION_LESS "1.21" OR gRPC_VERSION VERSION_GREATER "1.31")
     add_definitions(-DWITH_GRPC_CHANNEL_CLASS)
+endif()
+if(gRPC_VERSION VERSION_LESS "1.17")
+    add_definitions(-DWITH_GRPC_CREATE_CHANNEL_INTERNAL_UNIQUE_POINTER)
 endif()
 
 # will set `PROTOBUF_GENERATES`, indicates all generated .cc files, and a target `protobuf_generates`.
@@ -181,8 +224,12 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
 endif()
 
 check_cxx_compiler_flag(-Wno-c++17-extensions W_NO_CPP17_EXTENSIONS)
+check_cxx_compiler_flag(-Wno-extra-semi W_NO_EXTRA_SEMI)
 if(W_NO_CPP17_EXTENSIONS)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-c++17-extensions")
+endif()
+if(W_NO_EXTRA_SEMI)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-extra-semi")
 endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
@@ -205,6 +252,7 @@ if(NOT BUILD_ETCD_CORE_ONLY)
 endif()
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/etcd/v3/action_constants.hpp
               ${CMAKE_CURRENT_SOURCE_DIR}/etcd/v3/Transaction.hpp
+              ${CMAKE_CURRENT_SOURCE_DIR}/etcd/v3/Member.hpp
               DESTINATION include/etcd/v3)
 
 configure_file(etcd-cpp-api-config.in.cmake
@@ -290,6 +338,7 @@ set(CPACK_DEBIAN_PACKAGE_INSTALL "/usr/lib/lib*.so*"
                                  "/usr/include/etcd/*.hpp"
                                  "/usr/include/etcd/v3/action_constants.hpp"
                                  "/usr/include/etcd/v3/Transaction.hpp"
+                                 "/usr/include/etcd/v3/Member.hpp"
 )
 
 set(CPACK_DEBIAN_PACKAGE_BUILD_NUMBER_PREFIX "")
