@@ -198,37 +198,38 @@ void etcd::KeepAlive::Check() {
   return;
 }
 
-std::string etcd::KeepAlive::refresh() {
-  while (true) {
-    if (!continue_next.load()) {
-      return std::string{};
-    }
-    // minimal resolution: 1 second
-    int keepalive_ttl = std::max(ttl - 1, 1);
-    {
-      std::unique_lock<std::mutex> lock(mutex_for_refresh_);
-      if (cv_for_refresh_.wait_for(lock, std::chrono::seconds(keepalive_ttl)) ==
-          std::cv_status::no_timeout) {
-        if (!continue_next.load()) {
-          return std::string{};
-        }
-#ifndef NDEBUG
-        std::cerr
-            << "[warn] awaked from condition_variable but continue_next is "
-               "not set, maybe due to clock drift."
-            << std::endl;
-#endif
-      }
-    }
+// std::string etcd::KeepAlive::refresh() {
+//   while (true) {
+//     if (!continue_next.load()) {
+//       return std::string{};
+//     }
+//     // minimal resolution: 1 second
+//     int keepalive_ttl = std::max(ttl - 1, 1);
+//     {
+//       std::unique_lock<std::mutex> lock(mutex_for_refresh_);
+//       if (cv_for_refresh_.wait_for(lock, std::chrono::seconds(keepalive_ttl))
+//       ==
+//           std::cv_status::no_timeout) {
+//         if (!continue_next.load()) {
+//           return std::string{};
+//         }
+// #ifndef NDEBUG
+//         std::cerr
+//             << "[warn] awaked from condition_variable but continue_next is "
+//                "not set, maybe due to clock drift."
+//             << std::endl;
+// #endif
+//       }
+//     }
 
-    // execute refresh
-    const std::string err = this->refresh_once();
-    if (!err.empty()) {
-      return err;
-    }
-  }
-  return std::string{};
-}
+//     // execute refresh
+//     const std::string err = this->refresh_once();
+//     if (!err.empty()) {
+//       return err;
+//     }
+//   }
+//   return std::string{};
+// }
 
 std::string etcd::KeepAlive::refresh_once() {
   std::lock_guard<std::mutex> scope_lock(mutex_for_refresh_);

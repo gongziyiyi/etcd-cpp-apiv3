@@ -86,7 +86,7 @@ class KeepAlive {
 
  protected:
   // automatically refresh loop, returns the error message if failed
-  std::string refresh();
+  //   std::string refresh();
   // refresh once immediately, returns the error message if failed
   std::string refresh_once();
 
